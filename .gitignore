@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+settings.json
+_preview_frame.png
+_export_log.txt
+_proxy/
