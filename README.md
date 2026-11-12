@@ -7,6 +7,7 @@
 - Windows
 - Python 3（建議 3.11 以上）
 - Pillow：`pip install pillow`
+- tkinterdnd2（選用，啟用拖曳檔案功能）：`pip install tkinterdnd2`
 - ffmpeg 與 ffprobe，並加入系統 PATH
 
 ## 啟動

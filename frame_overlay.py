@@ -18,6 +18,12 @@ from tkinter import ttk, filedialog, messagebox, colorchooser
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
+try:   # 拖曳檔案功能需要 tkinterdnd2（pip install tkinterdnd2），沒有也能正常使用
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
 # 以 pythonw（無主控台）執行時，每次呼叫 ffmpeg/ffprobe 都會跳出終端機視窗，這裡統一隱藏
 if os.name == "nt":
     _orig_popen_init = subprocess.Popen.__init__
@@ -535,6 +541,9 @@ class App:
             v.trace_add("write", self.render_preview)
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if HAS_DND:
+            root.drop_target_register(DND_FILES)
+            root.dnd_bind("<<Drop>>", self.on_drop)
         self.sync_output(self.cfg["input"])
         self._poll()
         self.load_video(self.cfg["input"])
@@ -941,6 +950,18 @@ class App:
             self.color_btns[key].configure(bg=c)
             self.render_preview()
 
+    def on_drop(self, event):
+        """把影片檔拖進視窗，等同於用「選擇…」選取輸入影片。"""
+        paths = self.root.tk.splitlist(event.data)
+        if paths and os.path.isfile(paths[0]):
+            p = paths[0]
+            self.vars["input"].set(p)
+            self.sync_output(p)
+            self.load_video(p)
+        else:
+            self.status.configure(text="請拖入有效的影片檔案。")
+        return event.action
+
     def pick_input(self):
         p = filedialog.askopenfilename(filetypes=[("影片", "*.mp4 *.mov *.mkv *.avi"), ("所有檔案", "*.*")])
         if p:
@@ -1047,6 +1068,6 @@ class App:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     App(root)
     root.mainloop()
