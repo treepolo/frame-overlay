@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import collections
 import hashlib
+import math
 import multiprocessing
 import queue
 import threading
@@ -249,7 +250,7 @@ def block_metrics(cfg, n, s):
     }
 
 
-def draw_overlay(ov, cfg, n, s, X, Y, H):
+def draw_overlay(ov, cfg, n, s, X, Y, H, wm_below=None):
     """在 RGBA 圖 ov 上畫出底框與兩行文字。
     X, Y：底框左上角（ov 像素）；s：縮放；H：畫面高度（用來決定浮水印放上或下）。
     回傳底框範圍 (x0, y0, x1, y1)。"""
@@ -263,7 +264,8 @@ def draw_overlay(ov, cfg, n, s, X, Y, H):
 
     pad, inner = m["pad"], m["inner"]
     # 幀號中心在上半部 → 浮水印在下方；下半部 → 在上方
-    wm_below = (Y + m["h"] / 2) < H / 2
+    if wm_below is None:
+        wm_below = (Y + m["h"] / 2) < H / 2
     if wm_below:
         num_top = Y + pad
         wm_top = num_top + m["lhN"] + m["gap"]
@@ -285,6 +287,28 @@ def draw_overlay(ov, cfg, n, s, X, Y, H):
     return x0, y0, x1, y1
 
 
+BLOCK_KEYS = ("font_file", "font_size", "font_color", "border_on", "border_width", "border_color",
+              "box_on", "box_color", "box_opacity", "box_padding")
+_block_cache = collections.OrderedDict()
+
+
+def overlay_block(cfg, n, s, X, Y, H):
+    """取得單一幀的底框與文字小圖（透明背景）與它在畫面上的左上角。
+    同一組設定、同樣的幀號文字會重用快取，不必每幀重畫整張畫面。
+    回傳 (區塊影像, x, y)。"""
+    m = block_metrics(cfg, n, s)
+    wm_below = (Y + m["h"] / 2) < H / 2
+    key = (m["num_text"], wm_below, round(s, 6), tuple(cfg[k] for k in BLOCK_KEYS))
+    blk = _block_cache.get(key)
+    if blk is None:
+        blk = Image.new("RGBA", (math.ceil(m["w"]) + 1, math.ceil(m["h"]) + 1), (0, 0, 0, 0))
+        draw_overlay(blk, cfg, n, s, 0, 0, H, wm_below=wm_below)
+        _block_cache[key] = blk
+        if len(_block_cache) > 256:
+            _block_cache.popitem(last=False)
+    return blk, round(X), round(Y)
+
+
 # ---------- 匯出 ----------
 def encode_args(codec):
     if codec == "h264_nvenc":   # NVIDIA GPU 編碼
@@ -297,14 +321,17 @@ def render_chunk(cfg, start, frames, vw, vh):
     X, Y = cfg["x_frac"] * vw, cfg["y_frac"] * vh
     out = []
     for i, raw in enumerate(frames):
-        frame = Image.frombytes("RGB", (vw, vh), raw).convert("RGBA")
-        ov = Image.new("RGBA", (vw, vh), (0, 0, 0, 0))
-        draw_overlay(ov, cfg, start + i, 1.0, X, Y, vh)
-        out.append(Image.alpha_composite(frame, ov).convert("RGB").tobytes())
+        frame = Image.frombytes("RGB", (vw, vh), raw)
+        blk, bx, by = overlay_block(cfg, start + i, 1.0, X, Y, vh)
+        # 只對區塊範圍做混色，避免整張畫面轉成 RGBA 再轉回來
+        region = frame.crop((bx, by, bx + blk.width, by + blk.height))
+        blended = Image.composite(blk.convert("RGB"), region, blk.getchannel("A"))
+        frame.paste(blended, (bx, by))
+        out.append(frame.tobytes())
     return b"".join(out), len(frames)
 
 
-def _export_pass(cfg, ff, vw, vh, fps, total, codec, progress, workers):
+def _export_pass(cfg, ff, vw, vh, fps, total, codec, progress, workers, cancel=None):
     """回傳 (是否成功, 錯誤記錄)。"""
     size = vw * vh * 3
     chunk = 16
@@ -336,6 +363,9 @@ def _export_pass(cfg, ff, vw, vh, fps, total, codec, progress, workers):
         try:
             start = 0
             while True:
+                if cancel is not None and cancel.is_set():
+                    error = "已中斷"
+                    break
                 frames = []
                 for _ in range(chunk):
                     raw = dec.stdout.read(size)
@@ -350,11 +380,14 @@ def _export_pass(cfg, ff, vw, vh, fps, total, codec, progress, workers):
                     flush_one()
                 if len(frames) < chunk:
                     break
-            while pending:
+            while pending and error is None:
                 flush_one()
         except Exception as e:      # 包含編碼器失敗造成的 BrokenPipe
             error = str(e)
         finally:
+            if cancel is not None and cancel.is_set():
+                dec.kill()
+                enc.kill()
             pool.terminate()
             pool.join()
             try:
@@ -384,7 +417,7 @@ def nvenc_available(ff):
     return _nvenc_ok
 
 
-def run_export(cfg, progress=None):
+def run_export(cfg, progress=None, cancel=None):
     ff = shutil.which("ffmpeg")
     if not ff:
         return False, "找不到 ffmpeg，請安裝並加入系統 PATH。"
@@ -396,11 +429,15 @@ def run_export(cfg, progress=None):
     workers = max(1, (os.cpu_count() or 2) - 1)
 
     if nvenc_available(ff):
-        ok, msg = _export_pass(cfg, ff, vw, vh, fps, total, "h264_nvenc", progress, workers)
+        ok, msg = _export_pass(cfg, ff, vw, vh, fps, total, "h264_nvenc", progress, workers, cancel)
         if ok:
             return True, cfg["output"]
+        if cancel is not None and cancel.is_set():
+            return False, "已中斷"
     # 沒有可用的 NVIDIA 編碼器，或 GPU 編碼中途失敗：改用 CPU 編碼
-    ok, msg = _export_pass(cfg, ff, vw, vh, fps, total, "libx264", progress, workers)
+    ok, msg = _export_pass(cfg, ff, vw, vh, fps, total, "libx264", progress, workers, cancel)
+    if not ok and cancel is not None and cancel.is_set():
+        return False, "已中斷"
     return (True, cfg["output"]) if ok else (False, msg)
 
 
@@ -437,6 +474,7 @@ class App:
         self.cur_frame = 0
         self.fps = 30.0
         self.ui_queue = queue.Queue()
+        self.cancel_event = None
         self.total_frames = 0
         self.seek_dragging = False
         self.seek_token = 0
@@ -503,6 +541,8 @@ class App:
         ttk.Button(btns, text="儲存設定", command=self.save).pack(side="left")
         self.run_btn = ttk.Button(btns, text="開始輸出", command=self.start)
         self.run_btn.pack(side="right")
+        self.cancel_btn = ttk.Button(btns, text="中斷輸出", command=self.cancel_export, state="disabled")
+        self.cancel_btn.pack(side="right", padx=6)
         self.status = ttk.Label(frm, text="")
         self.status.grid(row=self.r + 1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.pbar = ttk.Progressbar(frm, length=400, mode="determinate", maximum=100)
@@ -799,9 +839,10 @@ class App:
         s = self.cw / self.vw
         self._clamp(cfg, n, s)
         img = Image.frombytes("RGB", (self.cw, self.ch), raw).convert("RGBA")
-        ov = Image.new("RGBA", (self.cw, self.ch), (0, 0, 0, 0))
-        self.hit = draw_overlay(ov, cfg, n, s, self.xf * self.cw, self.yf * self.ch, self.ch)
-        self.photo = ImageTk.PhotoImage(Image.alpha_composite(img, ov).convert("RGB"))
+        blk, bx, by = overlay_block(cfg, n, s, self.xf * self.cw, self.yf * self.ch, self.ch)
+        img.alpha_composite(blk, (bx, by))
+        self.hit = (bx, by, bx + blk.width, by + blk.height)
+        self.photo = ImageTk.PhotoImage(img.convert("RGB"))
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
         self.frame_label.configure(text=f"幀 {n}")
@@ -1040,6 +1081,8 @@ class App:
             return
         save_settings(cfg)
         self.run_btn.configure(state="disabled")
+        self.cancel_event = threading.Event()
+        self.cancel_btn.configure(state="normal")
         self.status.configure(text="輸出中，請稍候…")
         self.pbar.configure(mode="determinate", value=0)
 
@@ -1051,17 +1094,26 @@ class App:
                                self.status.configure(text=text)))
 
         def worker():
-            ok, msg = run_export(cfg, progress)
+            ok, msg = run_export(cfg, progress, self.cancel_event)
             self.post(self.done, ok, msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def cancel_export(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+            self.cancel_btn.configure(state="disabled")
+            self.status.configure(text="中斷中…")
+
     def done(self, ok, msg):
         self.run_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
         self.pbar.configure(value=100 if ok else 0)
         if ok:
             self.status.configure(text="完成：" + msg)
             messagebox.showinfo("完成", "已輸出：\n" + msg)
+        elif msg == "已中斷":
+            self.status.configure(text=f"已中斷輸出（未完成的檔案保留在：{self.vars['output'].get()}）")
         else:
             self.status.configure(text="失敗")
             messagebox.showerror("輸出失敗", msg)
